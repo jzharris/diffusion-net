@@ -7,6 +7,7 @@ import os.path
 import sys
 import random
 from multiprocessing import Pool
+import trimesh
 
 import numpy as np
 import scipy.spatial
@@ -415,9 +416,9 @@ def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=
     for num, i in tqdm(enumerate(inds)):
         # print("get_all_operators() processing {} / {} {:.3f}%".format(num, N, num / N * 100))
         if normals is None:
-            outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir)
+            _, *outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir)
         else:
-            outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir, normals=normals[i])
+            _, *outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir, normals=normals[i])
         frames[i] = outputs[0]
         massvec[i] = outputs[1]
         L[i] = outputs[2]
@@ -427,6 +428,74 @@ def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=
         gradY[i] = outputs[6]
         
     return frames, massvec, L, evals, evecs, gradX, gradY
+
+
+def precompute_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=None):
+    """
+    Just like get_operators, but only returns the list of npz files that were cached.
+    This is a way of streaming in files to the DataLoader with limited RAM.
+    """
+    N = len(verts_list)
+    search_paths = [None] * N
+
+    inds = [i for i in range(N)]
+    # process in random order
+    # random.shuffle(inds)
+   
+    print("precomputing {} meshes".format(len(inds)))
+    for num, i in tqdm(enumerate(inds)):
+        # print("get_all_operators() processing {} / {} {:.3f}%".format(num, N, num / N * 100))
+        if normals is None:
+            search_path, *_ = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir)
+        else:
+            search_path, *_ = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir, normals=normals[i])
+        search_paths[i] = search_path
+        
+    return search_paths
+
+def fetch_operator(search_path, device, dtype, k_eig=128):
+    """
+    Load in an operator given the cached filepath
+    """
+    try:
+        # print('loading path: ' + str(search_path))
+        npzfile = np.load(search_path, allow_pickle=True)
+
+        def read_sp_mat(prefix):
+            data = npzfile[prefix + "_data"]
+            indices = npzfile[prefix + "_indices"]
+            indptr = npzfile[prefix + "_indptr"]
+            shape = npzfile[prefix + "_shape"]
+            mat = scipy.sparse.csc_matrix((data, indices, indptr), shape=shape)
+            return mat
+
+        # This entry matches! Return it.
+        verts = npzfile["verts"]
+        faces = npzfile["faces"]
+        labels = npzfile["labels"]
+        frames = npzfile["frames"]
+        mass = npzfile["mass"]
+        L = read_sp_mat("L")
+        evals = npzfile["evals"][:k_eig]
+        evecs = npzfile["evecs"][:,:k_eig]
+        gradX = read_sp_mat("gradX")
+        gradY = read_sp_mat("gradY")
+
+        frames = torch.from_numpy(frames).to(device=device, dtype=dtype)
+        mass = torch.from_numpy(mass).to(device=device, dtype=dtype)
+        L = utils.sparse_np_to_torch(L).to(device=device, dtype=dtype)
+        evals = torch.from_numpy(evals).to(device=device, dtype=dtype)
+        evecs = torch.from_numpy(evecs).to(device=device, dtype=dtype)
+        gradX = utils.sparse_np_to_torch(gradX).to(device=device, dtype=dtype)
+        gradY = utils.sparse_np_to_torch(gradY).to(device=device, dtype=dtype)
+
+    except FileNotFoundError:
+        raise Exception("  cache miss -- constructing operators")
+    
+    except Exception as E:
+        raise Exception("unexpected error loading file: " + str(E))
+
+    return verts, faces, labels, frames, mass, L, evals, evecs, gradX, gradY
 
 def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, overwrite_cache=False):
     """
@@ -572,7 +641,107 @@ def get_operators(verts, faces, k_eig=128, op_cache_dir=None, normals=None, over
                      gradY_shape = gradY_np.shape,
                      )
 
-    return frames, mass, L, evals, evecs, gradX, gradY
+    return search_path, frames, mass, L, evals, evecs, gradX, gradY
+
+def get_cache_item(search_path, mesh_path, labels_path, dtype=np.float32, k_eig=128, overwrite_cache=False):
+    """
+    Given a filepath, get the entire cached item - verts, faces, labels, and ops
+    Otherwise, load it in from mesh and labels paths
+
+    See documentation for compute_operators(). This essentailly just wraps a call to compute_operators, using a cache if possible.
+    All arrays are always computed using double precision for stability, then truncated to single precision floats to store on disk, and finally returned as a tensor with dtype/device matching the `verts` input.
+    """
+
+    found = False
+    if os.path.exists(search_path):
+        while True:
+            try:
+                # print('loading path: ' + str(search_path))
+                npzfile = np.load(search_path, allow_pickle=True)
+                cache_k_eig = npzfile["k_eig"].item()
+
+                # If we're overwriting, or there aren't enough eigenvalues, just delete it; we'll create a new
+                # entry below more eigenvalues
+                if overwrite_cache: 
+                    print("  overwriting cache by request")
+                    os.remove(search_path)
+                    break
+                
+                if cache_k_eig < k_eig:
+                    print("  overwriting cache --- not enough eigenvalues")
+                    os.remove(search_path)
+                    break
+                
+                if "L_data" not in npzfile:
+                    print("  overwriting cache --- entries are absent")
+                    os.remove(search_path)
+                    break
+                
+                found = True
+                
+                break
+
+            except FileNotFoundError:
+                print("  cache miss -- constructing operators")
+                break
+            
+            except Exception as E:
+                print("unexpected error loading file: " + str(E))
+                print("-- constructing operators")
+                break
+
+    if not found:
+
+        try:
+            
+            labels = np.loadtxt(labels_path).astype(int)-1
+            if len(np.unique(labels)) == 1:
+                return False  # only one label found, skipping file
+
+            mesh = trimesh.load(mesh_path)
+            normals = torch.tensor(np.ascontiguousarray(mesh.vertex_normals))
+
+            # to torch
+            verts = normalize_positions(torch.tensor(np.ascontiguousarray(mesh.vertices)).float())
+            faces = torch.tensor(np.ascontiguousarray(mesh.faces))
+            labels = torch.tensor(np.ascontiguousarray(labels))
+
+            # No matching entry found; recompute.
+            frames, mass, L, evals, evecs, gradX, gradY = compute_operators(verts, faces, k_eig, normals=normals)
+
+            # Store it in the cache
+            L_np = utils.sparse_torch_to_np(L).astype(dtype)
+            gradX_np = utils.sparse_torch_to_np(gradX).astype(dtype)
+            gradY_np = utils.sparse_torch_to_np(gradY).astype(dtype)
+
+            np.savez(
+                search_path,
+                verts=toNP(verts).astype(dtype),
+                frames=toNP(frames).astype(dtype),
+                faces=toNP(faces).astype(int),
+                labels=toNP(labels).astype(int),
+                k_eig=k_eig,
+                mass=toNP(mass).astype(dtype),
+                L_data = L_np.data.astype(dtype),
+                L_indices = L_np.indices,
+                L_indptr = L_np.indptr,
+                L_shape = L_np.shape,
+                evals=toNP(evals).astype(dtype),
+                evecs=toNP(evecs).astype(dtype),
+                gradX_data = gradX_np.data.astype(dtype),
+                gradX_indices = gradX_np.indices,
+                gradX_indptr = gradX_np.indptr,
+                gradX_shape = gradX_np.shape,
+                gradY_data = gradY_np.data.astype(dtype),
+                gradY_indices = gradY_np.indices,
+                gradY_indptr = gradY_np.indptr,
+                gradY_shape = gradY_np.shape,
+                )
+        except Exception as E:
+            print(f"Error computing ops: {E}")
+            return False
+
+    return True
 
 def to_basis(values, basis, massvec):
     """
