@@ -19,6 +19,7 @@ import potpourri3d as pp3d
 
 import diffusion_net.utils as utils
 from .utils import toNP
+from tqdm import tqdm
 
 
 def norm(x, highdim=False):
@@ -106,9 +107,12 @@ def mesh_vertex_normals(verts, faces):
     for i in range(3):
         np.add.at(vertex_normals, faces[:,i], face_n)
 
-    vertex_normals = vertex_normals / np.linalg.norm(vertex_normals,axis=-1,keepdims=True)
-
-    return vertex_normals
+    try:
+        vertex_normals = vertex_normals / np.linalg.norm(vertex_normals,axis=-1,keepdims=True)
+        return vertex_normals
+    except Exception as e:
+        print(e)
+        return np.nan(verts.shape)
 
 
 def vertex_normals(verts, faces, n_neighbors_cloud=30):
@@ -407,8 +411,9 @@ def get_all_operators(verts_list, faces_list, k_eig, op_cache_dir=None, normals=
     # process in random order
     # random.shuffle(inds)
    
-    for num, i in enumerate(inds):
-        print("get_all_operators() processing {} / {} {:.3f}%".format(num, N, num / N * 100))
+    print("processing {} meshes".format(len(inds)))
+    for num, i in tqdm(enumerate(inds)):
+        # print("get_all_operators() processing {} / {} {:.3f}%".format(num, N, num / N * 100))
         if normals is None:
             outputs = get_operators(verts_list[i], faces_list[i], k_eig, op_cache_dir)
         else:
