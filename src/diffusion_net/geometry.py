@@ -481,14 +481,6 @@ def fetch_operator(search_path, device, dtype, k_eig=128):
         gradX = read_sp_mat("gradX")
         gradY = read_sp_mat("gradY")
 
-        frames = torch.from_numpy(frames).to(device=device, dtype=dtype)
-        mass = torch.from_numpy(mass).to(device=device, dtype=dtype)
-        L = utils.sparse_np_to_torch(L).to(device=device, dtype=dtype)
-        evals = torch.from_numpy(evals).to(device=device, dtype=dtype)
-        evecs = torch.from_numpy(evecs).to(device=device, dtype=dtype)
-        gradX = utils.sparse_np_to_torch(gradX).to(device=device, dtype=dtype)
-        gradY = utils.sparse_np_to_torch(gradY).to(device=device, dtype=dtype)
-
     except FileNotFoundError:
         raise Exception("  cache miss -- constructing operators")
     
